@@ -48,11 +48,11 @@ class MainActivity : AppCompatActivity() {
 
         tvSelectedFolder = findViewById(R.id.tvSelectedFolder)
 
-        // 初期表示用のダミーデータ（RadioFileの構造変更に合わせて修正）
+        // 初期表示用のダミーデータ（RadioFileParserを使用して生成）
         val dummyData = listOf(
-            RadioFile("TBSラジオ", "荻上チキ Session", "2026-06-15", "TBSラジオ_荻上チキSession_2026-06-15.m4a", "", "Sample/TBS/"),
-            RadioFile("NHKラジオ第1", "ラジオ深夜便", "2026-06-14", "NHKラジオ第1_ラジオ深夜便_2026-06-14.m4a", "", "Sample/NHK/"),
-            RadioFile("ニッポン放送", "オールナイトニッポン", "2026-06-13", "ニッポン放送_オールナイトニッポン_2026-06-13.mp3", "", "Sample/LFR/")
+            RadioFileParser.createRadioFile("TBSラジオ", "荻上チキSession", "2026-06-15.m4a", ""),
+            RadioFileParser.createRadioFile("NHKラジオ第1", "ラジオ深夜便", "20260614.m4a", ""),
+            RadioFileParser.createRadioFile("Radio", "ニッポン放送", "[ニッポン放送]伊集院光のタネ(TimeFree)_2026-06-13.mp3", "")
         )
 
         // RecyclerViewの設定
@@ -68,13 +68,13 @@ class MainActivity : AppCompatActivity() {
 
         // 再生操作ボタン
         findViewById<Button>(R.id.btnPlay).setOnClickListener {
-            Toast.makeText(this, "再生機能はDay 3以降で実装します", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "再生機能はDay 4以降で実装します", Toast.LENGTH_SHORT).show()
         }
         findViewById<Button>(R.id.btnPause).setOnClickListener {
-            Toast.makeText(this, "一時停止機能はDay 3以降で実装します", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "一時停止機能はDay 4以降で実装します", Toast.LENGTH_SHORT).show()
         }
         findViewById<Button>(R.id.btnStop).setOnClickListener {
-            Toast.makeText(this, "停止機能はDay 3以降で実装します", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "停止機能はDay 4以降で実装します", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -84,11 +84,17 @@ class MainActivity : AppCompatActivity() {
     private fun handleFolderSelected(uri: Uri) {
         val documentFile = DocumentFile.fromTreeUri(this, uri)
         if (documentFile != null && documentFile.isDirectory) {
-            tvSelectedFolder.text = "選択中: ${documentFile.name}"
+            val folderName = documentFile.name
+            // 表示用のテキストを設定
+            val folderDisplayName = if (folderName.isNullOrEmpty()) "フォルダ選択済み" else folderName
+            tvSelectedFolder.text = "選択中：$folderDisplayName"
+            
+            // 解析用に使用するルートフォルダ名（nullの場合は"Radio"として扱う）
+            val rootFolderNameForParser = folderName ?: "Radio"
             
             val foundFiles = mutableListOf<RadioFile>()
             // 再帰的にファイルをスキャン
-            scanDirectoryRecursively(documentFile, "", foundFiles)
+            scanDirectoryRecursively(documentFile, "", foundFiles, rootFolderNameForParser)
             
             if (foundFiles.isEmpty()) {
                 Toast.makeText(this, "音声ファイルが見つかりませんでした", Toast.LENGTH_SHORT).show()
@@ -101,39 +107,29 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 指定されたディレクトリ内を再帰的にスキャンして音声ファイルを抽出する
-     * @param directory スキャン対象のディレクトリ
-     * @param currentPath 選択したルートフォルダからの相対パス
-     * @param resultList 見つかったファイルを格納するリスト
      */
     private fun scanDirectoryRecursively(
         directory: DocumentFile,
         currentPath: String,
-        resultList: MutableList<RadioFile>
+        resultList: MutableList<RadioFile>,
+        rootFolderName: String
     ) {
         val files = directory.listFiles()
 
         for (file in files) {
             if (file.isDirectory) {
-                // ディレクトリの場合は再帰的に呼び出し
                 val nextPath = if (currentPath.isEmpty()) {
                     file.name ?: ""
                 } else {
                     "$currentPath/${file.name}"
                 }
-                scanDirectoryRecursively(file, nextPath, resultList)
+                scanDirectoryRecursively(file, nextPath, resultList, rootFolderName)
             } else if (file.isFile) {
-                // ファイルの場合は拡張子をチェック
                 val fileName = file.name ?: ""
                 if (isAudioFile(fileName)) {
+                    // RadioFileParser を使って解析
                     resultList.add(
-                        RadioFile(
-                            stationName = "未判定",
-                            programName = "未判定",
-                            broadcastDate = "未判定",
-                            fileName = fileName,
-                            uriString = file.uri.toString(),
-                            folderPath = currentPath
-                        )
+                        RadioFileParser.createRadioFile(rootFolderName, currentPath, fileName, file.uri.toString())
                     )
                 }
             }
