@@ -3,6 +3,9 @@ package com.koeradi.app
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.tts.TextToSpeech
 import android.text.Editable
 import android.text.TextWatcher
 import android.widget.Button
@@ -23,7 +26,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private lateinit var radioFileAdapter: RadioFileAdapter
     private lateinit var tvSelectedFolder: TextView
@@ -32,6 +35,12 @@ class MainActivity : AppCompatActivity() {
     
     private var player: ExoPlayer? = null
     private var selectedRadioFile: RadioFile? = null
+    private var tts: TextToSpeech? = null
+    private var isTtsReady = false
+
+    // 検索の読み上げ遅延用
+    private val searchReadHandler = Handler(Looper.getMainLooper())
+    private var searchReadRunnable: Runnable? = null
 
     // 全ての音声ファイルを保持するリスト（検索のベースになる）
     private var allRadioFiles: List<RadioFile> = listOf()
@@ -53,6 +62,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
+
+        // TextToSpeechの初期化
+        tts = TextToSpeech(this, this)
 
         // システムバーのインセット設定
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
@@ -81,8 +93,14 @@ class MainActivity : AppCompatActivity() {
         radioFileAdapter = RadioFileAdapter(allRadioFiles) { radioFile ->
             // タップ時の処理
             selectedRadioFile = radioFile
-            tvCurrentSelection.text = "選択中の番組：${radioFile.stationName} / ${radioFile.programName} / ${radioFile.broadcastDate}"
-            Toast.makeText(this, "${radioFile.programName} を選択しました", Toast.LENGTH_SHORT).show()
+            val selectionText = "${radioFile.stationName} / ${radioFile.programName} / ${radioFile.broadcastDate}"
+            tvCurrentSelection.text = "選択中の番組：$selectionText"
+            
+            val toastMessage = "${radioFile.programName} を選択しました"
+            Toast.makeText(this, toastMessage, Toast.LENGTH_SHORT).show()
+            
+            // 選択した番組を読み上げ
+            speak("${radioFile.stationName}、${radioFile.programName}、${radioFile.broadcastDate}を選択しました")
         }
         recyclerView.adapter = radioFileAdapter
 
@@ -107,13 +125,42 @@ class MainActivity : AppCompatActivity() {
 
         // 一時停止ボタン
         findViewById<Button>(R.id.btnPause).setOnClickListener {
+            speak("一時停止しました")
             player?.pause()
         }
 
         // 停止ボタン
         findViewById<Button>(R.id.btnStop).setOnClickListener {
+            speak("停止しました")
             player?.stop()
             player?.seekTo(0)
+        }
+    }
+
+    /**
+     * TextToSpeechの初期化完了時に呼ばれる
+     */
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val result = tts?.setLanguage(Locale.JAPANESE)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Toast.makeText(this, "日本語の読み上げがサポートされていません", Toast.LENGTH_SHORT).show()
+                isTtsReady = false
+            } else {
+                isTtsReady = true
+            }
+        } else {
+            Toast.makeText(this, "読み上げ機能の初期化に失敗しました", Toast.LENGTH_SHORT).show()
+            isTtsReady = false
+        }
+    }
+
+    /**
+     * 音声を読み上げる
+     */
+    private fun speak(text: String) {
+        if (isTtsReady) {
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "KoeRadiTTS")
         }
     }
 
@@ -121,6 +168,10 @@ class MainActivity : AppCompatActivity() {
      * 検索フィルターを適用する
      */
     private fun applySearchFilter(query: String) {
+        // 前回の読み上げ予約をキャンセル
+        searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
+        searchReadRunnable = null
+
         var searchQuery = query.trim().lowercase()
         
         // 簡易日付検索の対応
@@ -150,16 +201,28 @@ class MainActivity : AppCompatActivity() {
         }
         
         radioFileAdapter.updateData(filteredList)
+
+        // 検索結果の件数を少し遅れて読み上げる (クエリが空でない場合のみ)
+        if (searchQuery.isNotEmpty()) {
+            val runnable = Runnable {
+                speak("検索結果は ${filteredList.size} 件です")
+            }
+            searchReadRunnable = runnable
+            searchReadHandler.postDelayed(runnable, 1000) // 1秒入力が止まったら読み上げ
+        }
     }
 
     private fun playAudio() {
         val file = selectedRadioFile
         if (file == null || file.uriString.isEmpty()) {
-            Toast.makeText(this, "再生する音声ファイルを選択してください", Toast.LENGTH_SHORT).show()
+            val msg = "再生する音声ファイルを選択してください"
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            speak(msg)
             return
         }
 
         try {
+            speak("再生します")
             val uri = Uri.parse(file.uriString)
             val mediaItem = MediaItem.fromUri(uri)
             player?.setMediaItem(mediaItem)
@@ -174,6 +237,15 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         player?.release()
         player = null
+        
+        // 検索読み上げ予約の解除
+        searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
+        searchReadRunnable = null
+        
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        isTtsReady = false
     }
 
     /**
@@ -185,6 +257,7 @@ class MainActivity : AppCompatActivity() {
             val folderName = documentFile.name
             val folderDisplayName = if (folderName.isNullOrEmpty()) "フォルダ選択済み" else folderName
             tvSelectedFolder.text = "選択中：$folderDisplayName"
+            speak("フォルダを選択しました")
             
             val rootFolderNameForParser = folderName ?: "Radio"
             val foundFiles = mutableListOf<RadioFile>()
@@ -201,7 +274,11 @@ class MainActivity : AppCompatActivity() {
             player?.seekTo(0)
             
             if (allRadioFiles.isEmpty()) {
-                Toast.makeText(this, "音声ファイルが見つかりませんでした", Toast.LENGTH_SHORT).show()
+                val msg = "音声ファイルが見つかりませんでした"
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                speak(msg)
+            } else {
+                speak("音声ファイルが ${allRadioFiles.size} 件見つかりました")
             }
             
             // 現在の検索ワードがあれば適用、なければ全件表示
