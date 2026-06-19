@@ -1,10 +1,15 @@
 package com.koeradi.app
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.text.Editable
 import android.text.TextWatcher
@@ -15,6 +20,7 @@ import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.documentfile.provider.DocumentFile
@@ -25,6 +31,7 @@ import androidx.recyclerview.widget.RecyclerView
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.regex.Pattern
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
@@ -32,11 +39,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var tvSelectedFolder: TextView
     private lateinit var tvCurrentSelection: TextView
     private lateinit var etSearch: EditText
+    private lateinit var tvVoiceResult: TextView
     
     private var player: ExoPlayer? = null
     private var selectedRadioFile: RadioFile? = null
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
+
+    private var speechRecognizer: SpeechRecognizer? = null
 
     // 検索の読み上げ遅延用
     private val searchReadHandler = Handler(Looper.getMainLooper())
@@ -58,6 +68,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    // 録音権限のリクエスト用
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            startVoiceRecognition()
+        } else {
+            Toast.makeText(this, "音声操作にはマイクの権限が必要です", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -76,6 +97,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tvSelectedFolder = findViewById(R.id.tvSelectedFolder)
         tvCurrentSelection = findViewById(R.id.tvCurrentSelection)
         etSearch = findViewById(R.id.etSearch)
+        tvVoiceResult = findViewById(R.id.tvVoiceResult)
 
         // ExoPlayerの初期化
         player = ExoPlayer.Builder(this).build()
@@ -116,6 +138,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 「フォルダを選択」ボタン
         findViewById<Button>(R.id.btnSelectFolder).setOnClickListener {
             selectFolderLauncher.launch(null)
+        }
+
+        // 「音声操作」ボタン
+        findViewById<Button>(R.id.btnVoiceControl).setOnClickListener {
+            checkPermissionAndStartVoice()
         }
 
         // 再生ボタン
@@ -165,51 +192,131 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     /**
-     * 検索フィルターを適用する
+     * 検索フィルターを適用する (AND検索対応)
      */
     private fun applySearchFilter(query: String) {
         // 前回の読み上げ予約をキャンセル
         searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
         searchReadRunnable = null
 
-        var searchQuery = query.trim().lowercase()
-        
-        // 簡易日付検索の対応
-        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-        if (searchQuery == "今日") {
-            searchQuery = sdf.format(Calendar.getInstance().time)
-        } else if (searchQuery == "昨日") {
-            val cal = Calendar.getInstance()
-            cal.add(Calendar.DATE, -1)
-            searchQuery = sdf.format(cal.time)
-        }
+        val terms = buildSearchTerms(query)
 
-        val filteredList = if (searchQuery.isEmpty()) {
+        val filteredList = if (terms.isEmpty()) {
             allRadioFiles
         } else {
             allRadioFiles.filter { file ->
-                file.stationName.lowercase().contains(searchQuery) ||
-                file.programName.lowercase().contains(searchQuery) ||
-                file.broadcastDate.lowercase().contains(searchQuery) ||
-                file.fileName.lowercase().contains(searchQuery) ||
-                file.folderPath.lowercase().contains(searchQuery)
+                matchesAllTerms(file, terms)
             }
         }
 
-        if (filteredList.isEmpty() && searchQuery.isNotEmpty()) {
+        if (filteredList.isEmpty() && query.trim().isNotEmpty()) {
             Toast.makeText(this, "該当する音声ファイルがありません", Toast.LENGTH_SHORT).show()
         }
         
         radioFileAdapter.updateData(filteredList)
 
-        // 検索結果の件数を少し遅れて読み上げる (クエリが空でない場合のみ)
-        if (searchQuery.isNotEmpty()) {
+        // 検索結果の件数を少し遅れて読み上げる
+        if (query.trim().isNotEmpty()) {
             val runnable = Runnable {
                 speak("検索結果は ${filteredList.size} 件です")
             }
             searchReadRunnable = runnable
-            searchReadHandler.postDelayed(runnable, 1000) // 1秒入力が止まったら読み上げ
+            searchReadHandler.postDelayed(runnable, 1000)
         }
+    }
+
+    /**
+     * クエリを検索語リストに分解し、標準化する
+     */
+    private fun buildSearchTerms(query: String): List<String> {
+        if (query.isBlank()) return emptyList()
+
+        // 1. 全角を半角に、大文字を小文字に
+        val normalized = normalizeFullWidth(query).lowercase()
+
+        // 2. 区切り文字を半角スペースに統一
+        val sanitized = normalized
+            .replace("と", " ")
+            .replace("、", " ")
+            .replace(",", " ")
+
+        // 3. スペースで分割してリスト化
+        return sanitized.split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .map { normalizeSearchTerm(it) }
+    }
+
+    /**
+     * 特定のキーワードを検索用パターンに変換
+     */
+    private fun normalizeSearchTerm(term: String): String {
+        val cal = Calendar.getInstance()
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+
+        return when (term) {
+            "今日" -> sdf.format(cal.time)
+            "昨日" -> {
+                cal.add(Calendar.DATE, -1)
+                sdf.format(cal.time)
+            }
+            else -> {
+                // 1. yyyy年M月D日 形式
+                val fullMatcher = Pattern.compile("(\\d{4})年(\\d{1,2})月(\\d{1,2})日").matcher(term)
+                if (fullMatcher.find()) {
+                    return String.format(Locale.US, "%04d-%02d-%02d", 
+                        fullMatcher.group(1).toInt(), fullMatcher.group(2).toInt(), fullMatcher.group(3).toInt())
+                }
+
+                // 2. M月D日 形式 (今年)
+                val mdMatcher = Pattern.compile("(\\d{1,2})月(\\d{1,2})日").matcher(term)
+                if (mdMatcher.find()) {
+                    return String.format(Locale.US, "%04d-%02d-%02d", 
+                        cal.get(Calendar.YEAR), mdMatcher.group(1).toInt(), mdMatcher.group(2).toInt())
+                }
+
+                // 3. M/D 形式 (今年)
+                val slashMatcher = Pattern.compile("(\\d{1,2})/(\\d{1,2})").matcher(term)
+                if (slashMatcher.find()) {
+                    return String.format(Locale.US, "%04d-%02d-%02d", 
+                        cal.get(Calendar.YEAR), slashMatcher.group(1).toInt(), slashMatcher.group(2).toInt())
+                }
+
+                term
+            }
+        }
+    }
+
+    /**
+     * すべての検索語に一致するか判定
+     */
+    private fun matchesAllTerms(file: RadioFile, terms: List<String>): Boolean {
+        return terms.all { term -> matchesOneTerm(file, term) }
+    }
+
+    /**
+     * 1つの単語がいずれかの項目に含まれるか判定
+     */
+    private fun matchesOneTerm(file: RadioFile, term: String): Boolean {
+        // 全フィールドを連結して一括検索 (小文字化して比較)
+        val combinedFields = (file.stationName + file.programName + file.broadcastDate + file.fileName + file.folderPath).lowercase()
+        return combinedFields.contains(term)
+    }
+
+    /**
+     * 全角英数字を半角に変換する
+     */
+    private fun normalizeFullWidth(input: String): String {
+        val sb = StringBuilder()
+        for (c in input) {
+            if (c in '\uFF01'..'\uFF5E') {
+                sb.append((c - 0xFEE0))
+            } else if (c == '\u3000') {
+                sb.append(' ')
+            } else {
+                sb.append(c)
+            }
+        }
+        return sb.toString()
     }
 
     private fun playAudio() {
@@ -233,12 +340,103 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun checkPermissionAndStartVoice() {
+        when {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED -> {
+                startVoiceRecognition()
+            }
+            else -> {
+                requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+
+    private fun startVoiceRecognition() {
+        tts?.stop()
+
+        if (speechRecognizer == null) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    tvVoiceResult.text = "認識結果：お話しください..."
+                }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onError(error: Int) {
+                    val message = when (error) {
+                        SpeechRecognizer.ERROR_AUDIO -> "音声エラー"
+                        SpeechRecognizer.ERROR_CLIENT -> "クライアントエラー"
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "権限不足"
+                        SpeechRecognizer.ERROR_NETWORK -> "ネットワークエラー"
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "ネットワークタイムアウト"
+                        SpeechRecognizer.ERROR_NO_MATCH -> "認識できませんでした"
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "認識エンジンがビジーです"
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "発話タイムアウト"
+                        else -> "エラー ($error)"
+                    }
+                    tvVoiceResult.text = "認識結果：$message"
+                }
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    if (!matches.isNullOrEmpty()) {
+                        val command = matches[0]
+                        tvVoiceResult.text = "認識結果：$command"
+                        processVoiceCommand(command)
+                    }
+                }
+                override fun onPartialResults(partialResults: Bundle?) {}
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.JAPANESE.toString())
+        }
+        speechRecognizer?.startListening(intent)
+    }
+
+    private fun processVoiceCommand(command: String) {
+        val cmd = command.trim()
+
+        when {
+            cmd.contains("再生") -> {
+                playAudio()
+            }
+            cmd.contains("一時停止") -> {
+                speak("一時停止しました")
+                player?.pause()
+            }
+            cmd.contains("停止") -> {
+                speak("停止しました")
+                player?.stop()
+                player?.seekTo(0)
+            }
+            cmd.contains("検索をクリア") -> {
+                etSearch.setText("")
+                speak("検索をクリアしました")
+            }
+            cmd.contains("を探して") || cmd.contains("で検索") -> {
+                val query = cmd.replace("を探して", "").replace("で検索", "").trim()
+                if (query.isNotEmpty()) {
+                    etSearch.setText(query)
+                    // applySearchFilterは addTextChangedListener 経由で自動で呼ばれる
+                    speak("${query}を検索しました")
+                }
+            }
+            else -> {
+                speak("コマンドを認識できませんでした")
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         player?.release()
         player = null
         
-        // 検索読み上げ予約の解除
         searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
         searchReadRunnable = null
         
@@ -246,6 +444,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tts?.shutdown()
         tts = null
         isTtsReady = false
+
+        speechRecognizer?.destroy()
+        speechRecognizer = null
     }
 
     /**
@@ -265,11 +466,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             
             allRadioFiles = foundFiles
             
-            // 選択状態をリセット
             selectedRadioFile = null
             tvCurrentSelection.text = "選択中の番組：未選択"
             
-            // 再生中の音声を停止
             player?.stop()
             player?.seekTo(0)
             
@@ -281,7 +480,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 speak("音声ファイルが ${allRadioFiles.size} 件見つかりました")
             }
             
-            // 現在の検索ワードがあれば適用、なければ全件表示
             applySearchFilter(etSearch.text.toString())
         }
     }
