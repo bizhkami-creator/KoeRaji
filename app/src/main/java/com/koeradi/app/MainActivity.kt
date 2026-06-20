@@ -11,6 +11,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.text.Editable
 import android.text.TextWatcher
 import android.widget.Button
@@ -47,6 +48,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var isTtsReady = false
 
     private var speechRecognizer: SpeechRecognizer? = null
+
+    // 音声操作時の再生状態管理
+    private var wasPlayingBeforeVoiceInput = false
+    private var shouldResumeAfterVoiceResponse = false
+    private var pendingTtsAction: (() -> Unit)? = null
 
     // 検索の読み上げ遅延用
     private val searchReadHandler = Handler(Looper.getMainLooper())
@@ -114,12 +120,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         recyclerView.layoutManager = LinearLayoutManager(this)
         radioFileAdapter = RadioFileAdapter(allRadioFiles) { radioFile ->
             // タップ時の処理
-            selectedRadioFile = radioFile
-            val selectionText = "${radioFile.stationName} / ${radioFile.programName} / ${radioFile.broadcastDate}"
-            tvCurrentSelection.text = "選択中の番組：$selectionText"
-            
-            val toastMessage = "${radioFile.programName} を選択しました"
-            Toast.makeText(this, toastMessage, Toast.LENGTH_SHORT).show()
+            selectRadioFile(radioFile)
             
             // 選択した番組を読み上げ
             speak("${radioFile.stationName}、${radioFile.programName}、${radioFile.broadcastDate}を選択しました")
@@ -152,15 +153,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         // 一時停止ボタン
         findViewById<Button>(R.id.btnPause).setOnClickListener {
-            speak("一時停止しました")
-            player?.pause()
+            speakThen("一時停止しました") {
+                player?.pause()
+            }
         }
 
         // 停止ボタン
         findViewById<Button>(R.id.btnStop).setOnClickListener {
-            speak("停止しました")
-            player?.stop()
-            player?.seekTo(0)
+            speakThen("停止しました") {
+                player?.stop()
+                player?.seekTo(0)
+            }
         }
     }
 
@@ -175,6 +178,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 isTtsReady = false
             } else {
                 isTtsReady = true
+                setupTtsProgressListener()
             }
         } else {
             Toast.makeText(this, "読み上げ機能の初期化に失敗しました", Toast.LENGTH_SHORT).show()
@@ -182,32 +186,54 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun setupTtsProgressListener() {
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                Handler(Looper.getMainLooper()).post {
+                    pendingTtsAction?.invoke()
+                    pendingTtsAction = null
+                }
+            }
+            override fun onError(utteranceId: String?) {
+                Handler(Looper.getMainLooper()).post {
+                    pendingTtsAction?.invoke()
+                    pendingTtsAction = null
+                }
+            }
+        })
+    }
+
     /**
-     * 音声を読み上げる
+     * 音声を読み上げる (即時)
      */
     private fun speak(text: String) {
         if (isTtsReady) {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "KoeRadiTTS")
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "KoeRadiTTS_${System.currentTimeMillis()}")
         }
     }
 
     /**
-     * 検索フィルターを適用する (AND検索対応)
+     * 音声を読み上げ、完了後にアクションを実行する
+     */
+    private fun speakThen(text: String, afterSpeech: (() -> Unit)? = null) {
+        if (isTtsReady) {
+            pendingTtsAction = afterSpeech
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "KoeRadiTTS_${System.currentTimeMillis()}")
+        } else {
+            afterSpeech?.invoke()
+        }
+    }
+
+    /**
+     * 検索フィルターを適用しUIを更新する
      */
     private fun applySearchFilter(query: String) {
         // 前回の読み上げ予約をキャンセル
         searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
         searchReadRunnable = null
 
-        val terms = buildSearchTerms(query)
-
-        val filteredList = if (terms.isEmpty()) {
-            allRadioFiles
-        } else {
-            allRadioFiles.filter { file ->
-                matchesAllTerms(file, terms)
-            }
-        }
+        val filteredList = filterRadioFiles(query)
 
         if (filteredList.isEmpty() && query.trim().isNotEmpty()) {
             Toast.makeText(this, "該当する音声ファイルがありません", Toast.LENGTH_SHORT).show()
@@ -229,6 +255,61 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     /**
+     * クエリに基づいてリストをフィルタリングする (AND検索)
+     */
+    private fun filterRadioFiles(query: String): List<RadioFile> {
+        val terms = buildSearchTerms(query)
+        return if (terms.isEmpty()) {
+            allRadioFiles
+        } else {
+            allRadioFiles.filter { file ->
+                matchesAllTerms(file, terms)
+            }
+        }
+    }
+
+    /**
+     * 音声コマンド「○○を再生」用の処理
+     */
+    private fun playBySearchQuery(query: String) {
+        val filteredList = filterRadioFiles(query)
+        
+        // 検索欄を更新し、リストを表示する
+        etSearch.setText(query)
+        // applySearchFilterの自動読み上げと被らないようにキャンセル
+        searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
+
+        if (filteredList.isEmpty()) {
+            selectedRadioFile = null
+            tvCurrentSelection.text = "選択中の番組：未選択"
+            speakThen("該当する音声ファイルが見つかりませんでした") {
+                resumePlaybackIfNeeded()
+            }
+        } else {
+            val file = filteredList[0]
+            selectRadioFile(file)
+            
+            val count = filteredList.size
+            val message = if (count == 1) "1件見つかりました。再生します" else "${count}件見つかりました。最初の音声を再生します"
+            
+            clearResumeAfterVoiceInput() // 新しい再生をするので再開フラグを折る
+
+            speakThen(message) {
+                startPlaybackWithoutAnnouncement()
+            }
+        }
+    }
+
+    /**
+     * 番組を選択状態にする
+     */
+    private fun selectRadioFile(radioFile: RadioFile) {
+        selectedRadioFile = radioFile
+        val selectionText = "${radioFile.stationName} / ${radioFile.programName} / ${radioFile.broadcastDate}"
+        tvCurrentSelection.text = "選択中の番組：$selectionText"
+    }
+
+    /**
      * 検索結果が1件の場合に自動選択する
      */
     private fun updateAutoSelection(filteredList: List<RadioFile>, isSearchActive: Boolean) {
@@ -236,9 +317,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (filteredList.size == 1) {
             val file = filteredList[0]
-            selectedRadioFile = file
-            val selectionText = "${file.stationName} / ${file.programName} / ${file.broadcastDate}"
-            tvCurrentSelection.text = "選択中の番組：$selectionText"
+            selectRadioFile(file)
             
             // 自動選択を読み上げ
             speak("${file.stationName}、${file.programName}、${file.broadcastDate}を選択しました")
@@ -258,16 +337,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 1. 全角を半角に、大文字を小文字に
         val normalized = normalizeFullWidth(query).lowercase()
 
-        // 2. 区切り文字を半角スペースに統一
-        val sanitized = normalized
+        // 2. 日付表現を yyyy-MM-dd に変換して抽出
+        val (dateTerms, remainingQuery) = extractDateTerms(normalized)
+
+        // 3. 区切り文字を半角スペースに統一 (「と」など)
+        val sanitized = remainingQuery
             .replace("と", " ")
             .replace("、", " ")
             .replace(",", " ")
 
-        // 3. スペースで分割してリスト化
-        return sanitized.split(Regex("\\s+"))
+        // 4. スペースで分割してリスト化
+        val keywordTerms = sanitized.split(Regex("\\s+"))
             .filter { it.isNotBlank() }
             .map { normalizeSearchTerm(it) }
+
+        return dateTerms + keywordTerms
     }
 
     /**
@@ -279,8 +363,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         return when (term) {
             "今日" -> sdf.format(cal.time)
-            "昨日" -> {
+            "昨日", "きのう" -> {
                 cal.add(Calendar.DATE, -1)
+                sdf.format(cal.time)
+            }
+            "おととい", "一昨日" -> {
+                cal.add(Calendar.DATE, -2)
                 sdf.format(cal.time)
             }
             else -> {
@@ -308,6 +396,82 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 term
             }
         }
+    }
+
+    /**
+     * クエリから日付表現を抽出して yyyy-MM-dd に変換し、残りの文字列を返す
+     */
+    private fun extractDateTerms(query: String): Pair<List<String>, String> {
+        var currentQuery = query
+        val dateTerms = mutableListOf<String>()
+
+        // 1. 「先週のX曜日」の検出
+        val weekdayPattern = Pattern.compile("先週の(月|火|水|木|金|土|日)曜日?")
+        val weekdayMatcher = weekdayPattern.matcher(currentQuery)
+        while (weekdayMatcher.find()) {
+            val dayStr = weekdayMatcher.group(1)
+            val dayOfWeek = when (dayStr) {
+                "月" -> Calendar.MONDAY
+                "火" -> Calendar.TUESDAY
+                "水" -> Calendar.WEDNESDAY
+                "木" -> Calendar.THURSDAY
+                "金" -> Calendar.FRIDAY
+                "土" -> Calendar.SATURDAY
+                "日" -> Calendar.SUNDAY
+                else -> -1
+            }
+            if (dayOfWeek != -1) {
+                dateTerms.add(getLastWeekdayDate(dayOfWeek))
+                currentQuery = currentQuery.replace(weekdayMatcher.group(0), " ")
+            }
+        }
+
+        // 2. 「X日前」の検出
+        val daysAgoPattern = Pattern.compile("(\\d+)日前")
+        val daysAgoMatcher = daysAgoPattern.matcher(currentQuery)
+        while (daysAgoMatcher.find()) {
+            val days = daysAgoMatcher.group(1).toInt()
+            dateTerms.add(getDateDaysAgo(days))
+            currentQuery = currentQuery.replace(daysAgoMatcher.group(0), " ")
+        }
+
+        // 3. 「おととい」「一昨日」「昨日」「きのう」の検出 (「と」分割対策で先に処理)
+        val relativeDates = mapOf(
+            "おととい" to getDateDaysAgo(2),
+            "一昨日" to getDateDaysAgo(2),
+            "昨日" to getDateDaysAgo(1),
+            "きのう" to getDateDaysAgo(1)
+        )
+        for ((word, date) in relativeDates) {
+            if (currentQuery.contains(word)) {
+                dateTerms.add(date)
+                currentQuery = currentQuery.replace(word, " ")
+            }
+        }
+
+        return Pair(dateTerms, currentQuery)
+    }
+
+    /**
+     * 指定された日数前の日付を yyyy-MM-dd で取得
+     */
+    private fun getDateDaysAgo(daysAgo: Int): String {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DATE, -daysAgo)
+        return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(cal.time)
+    }
+
+    /**
+     * 先週の指定された曜日の日付を yyyy-MM-dd で取得
+     */
+    private fun getLastWeekdayDate(dayOfWeek: Int): String {
+        val cal = Calendar.getInstance()
+        cal.firstDayOfWeek = Calendar.MONDAY
+        // 今週の該当曜日まで戻す
+        cal.set(Calendar.DAY_OF_WEEK, dayOfWeek)
+        // さらに1週間（7日）戻す
+        cal.add(Calendar.DATE, -7)
+        return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(cal.time)
     }
 
     /**
@@ -351,9 +515,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             speak(msg)
             return
         }
+        speakThen("再生します") {
+            playAudioInternal()
+        }
+    }
+
+    /**
+     * 音声の案内なしで再生を開始する
+     */
+    private fun startPlaybackWithoutAnnouncement() {
+        playAudioInternal()
+    }
+
+    /**
+     * 音声の再生を実行する内部処理
+     */
+    private fun playAudioInternal() {
+        val file = selectedRadioFile ?: return
+        if (file.uriString.isEmpty()) return
 
         try {
-            speak("再生します")
             val uri = Uri.parse(file.uriString)
             val mediaItem = MediaItem.fromUri(uri)
             player?.setMediaItem(mediaItem)
@@ -375,7 +556,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun pausePlaybackForVoiceInput() {
+        wasPlayingBeforeVoiceInput = player?.isPlaying == true
+        shouldResumeAfterVoiceResponse = wasPlayingBeforeVoiceInput
+        if (wasPlayingBeforeVoiceInput) {
+            player?.pause()
+        }
+    }
+
+    private fun resumePlaybackIfNeeded() {
+        if (shouldResumeAfterVoiceResponse) {
+            player?.play()
+        }
+        shouldResumeAfterVoiceResponse = false
+    }
+
+    private fun clearResumeAfterVoiceInput() {
+        shouldResumeAfterVoiceResponse = false
+    }
+
     private fun startVoiceRecognition() {
+        pausePlaybackForVoiceInput()
         tts?.stop()
 
         if (speechRecognizer == null) {
@@ -401,6 +602,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         else -> "エラー ($error)"
                     }
                     tvVoiceResult.text = "認識結果：$message"
+                    speakThen("認識できませんでした") {
+                        resumePlaybackIfNeeded()
+                    }
                 }
                 override fun onResults(results: Bundle?) {
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -415,45 +619,100 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             })
         }
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        val properIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.JAPANESE.toString())
         }
-        speechRecognizer?.startListening(intent)
+        speechRecognizer?.startListening(properIntent)
     }
 
     private fun processVoiceCommand(command: String) {
         val cmd = command.trim()
+        val searchQuery = extractSearchQuery(cmd)
 
         when {
-            cmd.contains("再生") -> {
-                playAudio()
-            }
-            cmd.contains("一時停止") -> {
-                speak("一時停止しました")
-                player?.pause()
-            }
-            cmd.contains("停止") -> {
-                speak("停止しました")
-                player?.stop()
-                player?.seekTo(0)
-            }
             cmd.contains("検索をクリア") -> {
                 etSearch.setText("")
-                speak("検索をクリアしました")
+                speakThen("検索をクリアしました") {
+                    resumePlaybackIfNeeded()
+                }
             }
-            cmd.contains("を探して") || cmd.contains("で検索") -> {
-                val query = cmd.replace("を探して", "").replace("で検索", "").trim()
+            cmd.contains("一時停止") -> {
+                clearResumeAfterVoiceInput()
+                speakThen("一時停止しました") {
+                    player?.pause()
+                }
+            }
+            cmd.contains("停止") -> {
+                clearResumeAfterVoiceInput()
+                speakThen("停止しました") {
+                    player?.stop()
+                    player?.seekTo(0)
+                }
+            }
+            cmd.contains("を再生") -> {
+                clearResumeAfterVoiceInput()
+                val query = cmd.replace("を再生", "").trim()
                 if (query.isNotEmpty()) {
-                    etSearch.setText(query)
-                    // applySearchFilterは addTextChangedListener 経由で自動で呼ばれる
-                    speak("${query}を検索しました")
+                    playBySearchQuery(query)
+                } else {
+                    playAudio()
+                }
+            }
+            cmd.contains("再生") -> {
+                clearResumeAfterVoiceInput()
+                playAudio()
+            }
+            searchQuery != null -> {
+                etSearch.setText(searchQuery)
+                // applySearchFilterの自動読み上げを避けるならここでもキャンセル
+                searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
+                
+                val count = filterRadioFiles(searchQuery).size
+                speakThen("${searchQuery}を検索しました。検索結果は ${count} 件です") {
+                    resumePlaybackIfNeeded()
                 }
             }
             else -> {
-                speak("コマンドを認識できませんでした")
+                speakThen("コマンドを認識できませんでした") {
+                    resumePlaybackIfNeeded()
+                }
             }
         }
+    }
+
+    /**
+     * 音声コマンドから検索クエリを抽出する
+     */
+    private fun extractSearchQuery(command: String): String? {
+        var query = command.trim()
+
+        val searchSuffixes = listOf(
+            "を探してください",
+            "を探して",
+            "を探す",
+            "で探して",
+            "を検索してください",
+            "を検索して",
+            "を検索",
+            "で検索して",
+            "で検索",
+            "検索して",
+            "検索",
+            "を調べてください",
+            "を調べて",
+            "調べてください",
+            "調べて"
+        )
+
+        for (suffix in searchSuffixes) {
+            if (query.endsWith(suffix)) {
+                query = query.removeSuffix(suffix).trim()
+                return query.ifEmpty { null }
+            }
+        }
+
+        return null
     }
 
     override fun onDestroy() {
