@@ -215,6 +215,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         
         radioFileAdapter.updateData(filteredList)
 
+        // 自動選択の更新
+        updateAutoSelection(filteredList, query.isNotBlank())
+
         // 検索結果の件数を少し遅れて読み上げる
         if (query.trim().isNotEmpty()) {
             val runnable = Runnable {
@@ -222,6 +225,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             searchReadRunnable = runnable
             searchReadHandler.postDelayed(runnable, 1000)
+        }
+    }
+
+    /**
+     * 検索結果が1件の場合に自動選択する
+     */
+    private fun updateAutoSelection(filteredList: List<RadioFile>, isSearchActive: Boolean) {
+        if (!isSearchActive) return // 検索中でなければ何もしない
+
+        if (filteredList.size == 1) {
+            val file = filteredList[0]
+            selectedRadioFile = file
+            val selectionText = "${file.stationName} / ${file.programName} / ${file.broadcastDate}"
+            tvCurrentSelection.text = "選択中の番組：$selectionText"
+            
+            // 自動選択を読み上げ
+            speak("${file.stationName}、${file.programName}、${file.broadcastDate}を選択しました")
+        } else {
+            // 0件または2件以上の場合は選択解除
+            selectedRadioFile = null
+            tvCurrentSelection.text = "選択中の番組：未選択"
         }
     }
 
