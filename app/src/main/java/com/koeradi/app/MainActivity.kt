@@ -60,6 +60,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     // 全ての音声ファイルを保持するリスト（検索のベースになる）
     private var allRadioFiles: List<RadioFile> = listOf()
+    // 現在画面に表示されている音声ファイルのリスト（次へ/前への対象）
+    private var displayedRadioFiles: List<RadioFile> = listOf()
 
     // フォルダ選択の結果を受け取る設定
     private val selectFolderLauncher = registerForActivityResult(
@@ -114,6 +116,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             RadioFileParser.createRadioFile("NHKラジオ第1", "ラジオ深夜便", "20260614.m4a", ""),
             RadioFileParser.createRadioFile("Radio", "ニッポン放送", "[ニッポン放送]伊集院光のタネ(TimeFree)_2026-06-13.mp3", "")
         )
+        displayedRadioFiles = allRadioFiles
 
         // RecyclerViewの設定
         val recyclerView: RecyclerView = findViewById(R.id.rvRadioFiles)
@@ -121,9 +124,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         radioFileAdapter = RadioFileAdapter(allRadioFiles) { radioFile ->
             // タップ時の処理
             selectRadioFile(radioFile)
-            
-            // 選択した番組を読み上げ
-            speak("${radioFile.stationName}、${radioFile.programName}、${radioFile.broadcastDate}を選択しました")
         }
         recyclerView.adapter = radioFileAdapter
 
@@ -146,9 +146,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             checkPermissionAndStartVoice()
         }
 
+        // 前へボタン
+        findViewById<Button>(R.id.btnPrevious).setOnClickListener {
+            playPreviousAudio()
+        }
+
         // 再生ボタン
         findViewById<Button>(R.id.btnPlay).setOnClickListener {
-            playAudio()
+            playSelectedOrFirstDisplayedAudio()
         }
 
         // 一時停止ボタン
@@ -164,6 +169,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 player?.stop()
                 player?.seekTo(0)
             }
+        }
+
+        // 次へボタン
+        findViewById<Button>(R.id.btnNext).setOnClickListener {
+            playNextAudio()
         }
     }
 
@@ -234,6 +244,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         searchReadRunnable = null
 
         val filteredList = filterRadioFiles(query)
+        displayedRadioFiles = filteredList
 
         if (filteredList.isEmpty() && query.trim().isNotEmpty()) {
             Toast.makeText(this, "該当する音声ファイルがありません", Toast.LENGTH_SHORT).show()
@@ -276,6 +287,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         
         // 検索欄を更新し、リストを表示する
         etSearch.setText(query)
+        displayedRadioFiles = filteredList
+        radioFileAdapter.updateData(filteredList)
+        
         // applySearchFilterの自動読み上げと被らないようにキャンセル
         searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
 
@@ -287,26 +301,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         } else {
             val file = filteredList[0]
-            selectRadioFile(file)
-            
             val count = filteredList.size
-            val message = if (count == 1) "1件見つかりました。再生します" else "${count}件見つかりました。最初の音声を再生します"
+            val prefix = if (count == 1) "1件見つかりました。" else "${count}件見つかりました。最初の音声、"
             
             clearResumeAfterVoiceInput() // 新しい再生をするので再開フラグを折る
-
-            speakThen(message) {
-                startPlaybackWithoutAnnouncement()
-            }
+            playRadioFileWithAnnouncement(file, prefix)
         }
     }
 
     /**
      * 番組を選択状態にする
      */
-    private fun selectRadioFile(radioFile: RadioFile) {
+    private fun selectRadioFile(radioFile: RadioFile, announce: Boolean = true) {
         selectedRadioFile = radioFile
         val selectionText = "${radioFile.stationName} / ${radioFile.programName} / ${radioFile.broadcastDate}"
         tvCurrentSelection.text = "選択中の番組：$selectionText"
+        
+        if (announce) {
+            speak("${radioFile.stationName}、${radioFile.programName}、${radioFile.broadcastDate}を選択しました")
+        }
     }
 
     /**
@@ -318,14 +331,100 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (filteredList.size == 1) {
             val file = filteredList[0]
             selectRadioFile(file)
-            
-            // 自動選択を読み上げ
-            speak("${file.stationName}、${file.programName}、${file.broadcastDate}を選択しました")
         } else {
             // 0件または2件以上の場合は選択解除
             selectedRadioFile = null
             tvCurrentSelection.text = "選択中の番組：未選択"
         }
+    }
+
+    /**
+     * 現在選択中の音声を再生する。未選択ならリストの最初を選択して再生する。
+     */
+    private fun playSelectedOrFirstDisplayedAudio() {
+        val current = selectedRadioFile
+
+        if (current != null) {
+            playRadioFileWithAnnouncement(current)
+            return
+        }
+
+        val list = if (displayedRadioFiles.isNotEmpty()) {
+            displayedRadioFiles
+        } else {
+            allRadioFiles
+        }
+
+        if (list.isEmpty()) {
+            speakThen("再生できる音声ファイルがありません")
+            return
+        }
+
+        val target = list.first()
+        playRadioFileWithAnnouncement(target, "最初の音声、")
+    }
+
+    /**
+     * 音声情報の読み上げテキストを構築する
+     */
+    private fun buildPlaybackAnnouncement(file: RadioFile, prefix: String = ""): String {
+        return "${prefix}${file.stationName}、${file.programName}、${file.broadcastDate}を再生します"
+    }
+
+    /**
+     * 音声情報を読み上げた後に再生を開始する
+     */
+    private fun playRadioFileWithAnnouncement(file: RadioFile, prefix: String = "") {
+        selectRadioFile(file, announce = false)
+        val message = buildPlaybackAnnouncement(file, prefix)
+        speakThen(message) {
+            startPlaybackWithoutAnnouncement()
+        }
+    }
+
+    /**
+     * 次の音声ファイルを再生する
+     */
+    private fun playNextAudio() {
+        if (displayedRadioFiles.isEmpty()) {
+            speak("再生できる音声ファイルがありません")
+            return
+        }
+
+        if (displayedRadioFiles.size == 1) {
+            playRadioFileWithAnnouncement(displayedRadioFiles[0], "音声ファイルは1件のみです。")
+            return
+        }
+
+        val currentIndex = displayedRadioFiles.indexOf(selectedRadioFile)
+        val nextIndex = (currentIndex + 1) % displayedRadioFiles.size
+        val nextFile = displayedRadioFiles[nextIndex]
+
+        playRadioFileWithAnnouncement(nextFile, "次の音声、")
+    }
+
+    /**
+     * 前の音声ファイルを再生する
+     */
+    private fun playPreviousAudio() {
+        if (displayedRadioFiles.isEmpty()) {
+            speak("再生できる音声ファイルがありません")
+            return
+        }
+
+        if (displayedRadioFiles.size == 1) {
+            playRadioFileWithAnnouncement(displayedRadioFiles[0], "音声ファイルは1件のみです。")
+            return
+        }
+
+        val currentIndex = displayedRadioFiles.indexOf(selectedRadioFile)
+        var previousIndex = currentIndex - 1
+        if (previousIndex < 0) {
+            previousIndex = displayedRadioFiles.size - 1
+        }
+        val previousFile = displayedRadioFiles[previousIndex]
+
+        playRadioFileWithAnnouncement(previousFile, "前の音声、")
     }
 
     /**
@@ -507,19 +606,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return sb.toString()
     }
 
-    private fun playAudio() {
-        val file = selectedRadioFile
-        if (file == null || file.uriString.isEmpty()) {
-            val msg = "再生する音声ファイルを選択してください"
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-            speak(msg)
-            return
-        }
-        speakThen("再生します") {
-            playAudioInternal()
-        }
-    }
-
     /**
      * 音声の案内なしで再生を開始する
      */
@@ -643,6 +729,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     player?.pause()
                 }
             }
+            cmd.contains("前を再生") || cmd == "前" || cmd == "前へ" || cmd == "前の音声" || cmd == "前の番組" -> {
+                clearResumeAfterVoiceInput()
+                playPreviousAudio()
+            }
+            cmd.contains("次を再生") || cmd == "次" || cmd == "次へ" || cmd == "次の音声" || cmd == "次の番組" -> {
+                clearResumeAfterVoiceInput()
+                playNextAudio()
+            }
             cmd.contains("停止") -> {
                 clearResumeAfterVoiceInput()
                 speakThen("停止しました") {
@@ -656,12 +750,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 if (query.isNotEmpty()) {
                     playBySearchQuery(query)
                 } else {
-                    playAudio()
+                    playSelectedOrFirstDisplayedAudio()
                 }
             }
             cmd.contains("再生") -> {
                 clearResumeAfterVoiceInput()
-                playAudio()
+                playSelectedOrFirstDisplayedAudio()
             }
             searchQuery != null -> {
                 etSearch.setText(searchQuery)
@@ -748,6 +842,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             scanDirectoryRecursively(documentFile, "", foundFiles, rootFolderNameForParser)
             
             allRadioFiles = foundFiles
+            displayedRadioFiles = foundFiles
             
             selectedRadioFile = null
             tvCurrentSelection.text = "選択中の番組：未選択"
