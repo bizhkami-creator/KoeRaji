@@ -93,9 +93,32 @@
         android:layout_height="wrap_content"
         android:text="音声操作"
         android:layout_marginBottom="8dp"
-        app:layout_constraintBottom_toTopOf="@id/llControls"
+        app:layout_constraintBottom_toTopOf="@id/llSeekControls"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/llSeekControls"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:layout_marginBottom="8dp"
+        app:layout_constraintBottom_toTopOf="@id/llControls">
+
+        <Button
+            android:id="@+id/btnRewind"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="10秒戻る"
+            android:layout_marginEnd="16dp" />
+
+        <Button
+            android:id="@+id/btnForward"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="30秒進む" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/llControls"

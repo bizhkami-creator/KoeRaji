@@ -175,6 +175,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         findViewById<Button>(R.id.btnNext).setOnClickListener {
             playNextAudio()
         }
+
+        // 10秒戻るボタン
+        findViewById<Button>(R.id.btnRewind).setOnClickListener {
+            rewindAudio()
+        }
+
+        // 30秒進むボタン
+        findViewById<Button>(R.id.btnForward).setOnClickListener {
+            fastForwardAudio()
+        }
     }
 
     /**
@@ -425,6 +435,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val previousFile = displayedRadioFiles[previousIndex]
 
         playRadioFileWithAnnouncement(previousFile, "前の音声、")
+    }
+
+    /**
+     * 10秒戻る
+     */
+    private fun rewindAudio(seconds: Long = 10) {
+        val p = player
+        if (p == null || selectedRadioFile == null) {
+            speak("再生中の音声ファイルがありません")
+            return
+        }
+
+        val currentPos = p.currentPosition
+        val newPos = (currentPos - (seconds * 1000)).coerceAtLeast(0)
+        p.seekTo(newPos)
+        speak("${seconds}秒戻りました")
+    }
+
+    /**
+     * 30秒進む
+     */
+    private fun fastForwardAudio(seconds: Long = 30) {
+        val p = player
+        if (p == null || selectedRadioFile == null) {
+            speak("再生中の音声ファイルがありません")
+            return
+        }
+
+        val currentPos = p.currentPosition
+        val duration = p.duration
+        val newPos = if (duration > 0) {
+            (currentPos + (seconds * 1000)).coerceAtMost(duration)
+        } else {
+            currentPos + (seconds * 1000)
+        }
+        p.seekTo(newPos)
+        speak("${seconds}秒進みました")
     }
 
     /**
@@ -744,6 +791,41 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     player?.seekTo(0)
                 }
             }
+            cmd.contains("10秒戻る") || cmd == "十秒戻る" || cmd == "戻る" || cmd == "少し戻る" || cmd == "巻き戻し" -> {
+                val p = player
+                if (p == null || selectedRadioFile == null) {
+                    speakThen("再生中の音声ファイルがありません") {
+                        resumePlaybackIfNeeded()
+                    }
+                } else {
+                    val currentPos = p.currentPosition
+                    val newPos = (currentPos - 10000).coerceAtLeast(0)
+                    p.seekTo(newPos)
+                    speakThen("10秒戻りました") {
+                        resumePlaybackIfNeeded()
+                    }
+                }
+            }
+            cmd.contains("30秒進む") || cmd == "三十秒進む" || cmd == "進む" || cmd == "少し進む" || cmd == "早送り" -> {
+                val p = player
+                if (p == null || selectedRadioFile == null) {
+                    speakThen("再生中の音声ファイルがありません") {
+                        resumePlaybackIfNeeded()
+                    }
+                } else {
+                    val currentPos = p.currentPosition
+                    val duration = p.duration
+                    val newPos = if (duration > 0) {
+                        (currentPos + 30000).coerceAtMost(duration)
+                    } else {
+                        currentPos + 30000
+                    }
+                    p.seekTo(newPos)
+                    speakThen("30秒進みました") {
+                        resumePlaybackIfNeeded()
+                    }
+                }
+            }
             cmd.contains("を再生") -> {
                 clearResumeAfterVoiceInput()
                 val query = cmd.replace("を再生", "").trim()
@@ -759,7 +841,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             searchQuery != null -> {
                 etSearch.setText(searchQuery)
-                // applySearchFilterの自動読み上げを避けるならここでもキャンセル
+                // applySearchFilterの自動読み上げと被らないようにキャンセル
                 searchReadRunnable?.let { searchReadHandler.removeCallbacks(it) }
                 
                 val count = filterRadioFiles(searchQuery).size
